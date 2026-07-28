@@ -556,9 +556,9 @@
         <tbody id="paBody">
           {% for row in plan_actual.rows %}
           {% set pa_cls = 'pa-ok' if row.status == 'OK' else ('pa-dev' if row.status == 'MINOR_DEVIATION' else ('pa-maj' if row.status == 'MAJOR_DEVIATION' else ('pa-bnp' if row.status == 'BILLED_NOT_PLANNED' else ('pa-pnb' if row.status == 'PLANNED_NOT_BILLED' else 'pa-tar')))) %}
-          {% set ov_cls = 'ov-green' if row.overall_status == 'GREEN' else ('ov-yellow' if row.overall_status == 'YELLOW' else 'ov-red') %}
-          {% set rx_cls = 'rx-green' if row.prescription_status in ['WITHIN_LIMIT', 'NO_SERVICES'] else ('rx-yellow' if row.prescription_status == 'NEAR_LIMIT' else 'rx-red') %}
-          {% set rx_text = 'Gruen' if row.prescription_status in ['WITHIN_LIMIT', 'NO_SERVICES'] else ('Gelb' if row.prescription_status == 'NEAR_LIMIT' else 'Rot') %}
+          {% set ov_cls = 'ov-green' if row.overall_status in ['GREEN', 'Green', 'Gruen'] else ('ov-yellow' if row.overall_status in ['YELLOW', 'Yellow', 'Gelb'] else 'ov-red') %}
+          {% set rx_cls = 'rx-green' if row.prescription_status in ['WITHIN_LIMIT', 'NO_SERVICES', 'Green', 'Gruen'] else ('rx-yellow' if row.prescription_status in ['NEAR_LIMIT', 'Yellow', 'Gelb'] else 'rx-red') %}
+          {% set rx_text = 'Gruen' if row.prescription_status in ['WITHIN_LIMIT', 'NO_SERVICES', 'Green', 'Gruen'] else ('Gelb' if row.prescription_status in ['NEAR_LIMIT', 'Yellow', 'Gelb'] else 'Rot') %}
           {% set dev = row.deviation_minutes %}
           {% set dev_color = '#15803d' if dev is not none and dev|float <= 0 else ('#c2410c' if dev is not none else '#6b6b6b') %}
           <tr data-status="{{ row.overall_status }}" data-patient="{{ row.patient|lower }}">

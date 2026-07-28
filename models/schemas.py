@@ -48,6 +48,7 @@ class PlanActualRow(BaseModel):
     prescription_status: str = ""
     overall_status: str = ""
     status: str = ""
+    status_color: Optional[str] = None
     note: Optional[str] = None
 
 

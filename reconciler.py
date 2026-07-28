@@ -86,19 +86,65 @@ def _detail_to_overall(status: str) -> OverallStatus:
     if status in {
         PlanActualStatus.MAJOR_DEVIATION.value,
         PlanActualStatus.PLANNED_NOT_BILLED.value,
+        PlanActualStatus.BILLED_NOT_PLANNED.value,
         PlanActualStatus.TARIFF_MISMATCH.value,
     }:
         return OverallStatus.RED
     if status in {
         PlanActualStatus.MINOR_DEVIATION.value,
-        PlanActualStatus.BILLED_NOT_PLANNED.value,
     }:
         return OverallStatus.YELLOW
     return OverallStatus.GREEN
 
 
 def _merge_overall(detail_status: str, prescription_status: str) -> OverallStatus:
+    if prescription_status in {"Red", "Rot", ReconciliationStatus.NO_PRESCRIPTION.value, ReconciliationStatus.EXCEEDED.value, ReconciliationStatus.OUT_OF_RANGE.value}:
+        return OverallStatus.RED
     return _detail_to_overall(detail_status)
+
+
+def _check_prescription_01(
+    prescriptions_df: pd.DataFrame,
+    name_key: str,
+    service_date: datetime | None,
+) -> str:
+    if prescriptions_df.empty or not name_key:
+        return "Red"
+
+    patient_rx = prescriptions_df[prescriptions_df["patient_key"] == name_key]
+    if patient_rx.empty:
+        return "Red"
+
+    if service_date is not None:
+        in_period_rx = patient_rx[patient_rx.apply(
+            lambda r: _in_period(service_date, service_date, r.get("valid_from"), r.get("valid_to")),
+            axis=1,
+        )]
+    else:
+        in_period_rx = patient_rx
+
+    if in_period_rx.empty:
+        return "Red"
+
+    for _, presc in in_period_rx.iterrows():
+        tz = str(presc.get("Tarifziffer") or presc.get("tariff_key") or "").strip()
+        tc = str(presc.get("Tarifcode") or "").strip()
+        if tz == "53201" or tz.endswith("01") or tc == "01" or tc == "53201":
+            return ReconciliationStatus.WITHIN_LIMIT.value
+
+    return "Red"
+
+
+def _compute_status_color(overall_status: str, detail_status: str, prescription_status: str) -> str:
+    if (
+        overall_status in {OverallStatus.RED.value, "RED", "Rot", "Red"}
+        or prescription_status in {"Red", "Rot", ReconciliationStatus.NO_PRESCRIPTION.value, ReconciliationStatus.EXCEEDED.value}
+        or detail_status in {PlanActualStatus.PLANNED_NOT_BILLED.value, PlanActualStatus.BILLED_NOT_PLANNED.value, PlanActualStatus.MAJOR_DEVIATION.value, PlanActualStatus.TARIFF_MISMATCH.value}
+    ):
+        return "Red"
+    if overall_status in {OverallStatus.YELLOW.value, "YELLOW", "Gelb", "Yellow"} or detail_status == PlanActualStatus.MINOR_DEVIATION.value:
+        return "Yellow"
+    return "Green"
 
 
 def _fmt_date(dt: datetime | None) -> str | None:
@@ -291,7 +337,6 @@ def reconcile_plan_actual(
 
     pa_rows: list[PlanActualRow] = []
     matched_ctrl_idx: set = set()
-    _, rx_lookup, _ = _build_prescription_rows(prescriptions_df, controlling_df)
 
     for _, plan in planning_df.iterrows():
         name_key = plan["name_key"]
@@ -306,56 +351,67 @@ def reconcile_plan_actual(
         tariff_p = str(plan.get("tariff_key") or plan.get("tarifziffer") or "").strip()
         plan_date_display = _fmt_date(plan_date)
         plan_time_display = _fmt_time_window(plan_start, plan_end)
+        planned_employee = str(plan.get("employee") or "").strip()
 
         if patient_id:
             patient_mask = (controlling_df["patient_id"] == patient_id) | (controlling_df["name_key"] == name_key)
         else:
             patient_mask = controlling_df["name_key"] == name_key
 
-        candidates = controlling_df[patient_mask]
-        fallback_candidates = candidates
-        if tariff_p:
-            tariff_candidates = candidates[candidates["tariff_key"] == tariff_p]
-            if not tariff_candidates.empty:
-                fallback_candidates = tariff_candidates
+        available_candidates = controlling_df[patient_mask & (~controlling_df.index.isin(matched_ctrl_idx))]
 
-        matches = pd.DataFrame()
-        if plan_start and plan_end:
-            matches = candidates[candidates.apply(
-                lambda r: _time_overlap(plan_start, plan_end, r.get("service_start"), r.get("service_end")),
-                axis=1,
-            )]
-            if matches.empty and plan_date is not None:
-                matches = fallback_candidates[fallback_candidates["service_date"].apply(
+        best_match_idx = None
+        best_match_row = None
+
+        if not available_candidates.empty:
+            if plan_start and plan_end:
+                overlap_mask = available_candidates.apply(
+                    lambda r: _time_overlap(plan_start, plan_end, r.get("service_start"), r.get("service_end")),
+                    axis=1,
+                )
+                overlap_candidates = available_candidates[overlap_mask]
+                if not overlap_candidates.empty:
+                    if tariff_p:
+                        same_tariff = overlap_candidates[overlap_candidates["tariff_key"] == tariff_p]
+                        if not same_tariff.empty:
+                            overlap_candidates = same_tariff
+                    best_match_idx = overlap_candidates.index[0]
+                    best_match_row = overlap_candidates.iloc[0]
+
+            if best_match_row is None and plan_date is not None:
+                date_candidates = available_candidates[available_candidates["service_date"].apply(
                     lambda d: d is not None and d == plan_date
                 )]
-            if matches.empty and plan_date is not None:
-                matches = fallback_candidates[fallback_candidates["service_date"].apply(
+                if not date_candidates.empty:
+                    if tariff_p:
+                        same_tariff = date_candidates[date_candidates["tariff_key"] == tariff_p]
+                        if not same_tariff.empty:
+                            date_candidates = same_tariff
+                    best_match_idx = date_candidates.index[0]
+                    best_match_row = date_candidates.iloc[0]
+
+            if best_match_row is None and plan_date is not None:
+                prox_candidates = available_candidates[available_candidates["service_date"].apply(
                     lambda d: d is not None and 0 < (d - plan_date).days <= 1
                 )]
-        else:
-            if plan_date is not None:
-                matches = fallback_candidates[fallback_candidates["service_date"].apply(
-                    lambda d: d is not None and d == plan_date
-                )]
-                if matches.empty:
-                    matches = fallback_candidates[fallback_candidates["service_date"].apply(
-                        lambda d: d is not None and 0 < (d - plan_date).days <= 1
-                    )]
-            else:
-                matches = candidates.iloc[0:0]
+                if not prox_candidates.empty:
+                    if tariff_p:
+                        same_tariff = prox_candidates[prox_candidates["tariff_key"] == tariff_p]
+                        if not same_tariff.empty:
+                            prox_candidates = same_tariff
+                    best_match_idx = prox_candidates.index[0]
+                    best_match_row = prox_candidates.iloc[0]
 
-        if matches.empty:
-            if not tariff_p:
-                prescription_status = ReconciliationStatus.NO_SERVICES.value
-            else:
-                prescription_status = _choose_prescription_status(rx_lookup, name_key, tariff_p, plan_date)
+        if best_match_row is None:
+            prescription_status = _check_prescription_01(prescriptions_df, name_key, plan_date)
             detail_status = PlanActualStatus.PLANNED_NOT_BILLED.value
             overall = _merge_overall(detail_status, prescription_status)
+            color = _compute_status_color(overall.value, detail_status, prescription_status)
+
             pa_rows.append(
                 PlanActualRow(
                     patient=str(plan.get("patient_col") or name_key),
-                    employee=None,
+                    employee=planned_employee or None,
                     service_date=plan_date_display,
                     planned_time=plan_time_display,
                     recorded_time=None,
@@ -368,30 +424,24 @@ def reconcile_plan_actual(
                     prescription_status=prescription_status,
                     overall_status=overall.value,
                     status=detail_status,
+                    status_color=color,
                     note="Kein überlappender Ist-Einsatz gefunden",
                 )
             )
             continue
 
-        matched_ctrl_idx.update(matches.index.tolist())
-
-        actual_min = float(matches["duration_min"].sum())
+        matched_ctrl_idx.add(best_match_idx)
+        actual_min = float(best_match_row.get("duration_min") or 0)
         deviation = round(actual_min - plan_min, 1) if plan_min > 0 else None
 
-        actual_tariffs = sorted({str(t).strip() for t in matches["tariff_key"].tolist() if str(t).strip()})
-        actual_tariff_display = ", ".join(actual_tariffs) if actual_tariffs else None
-        employee_display = ", ".join(sorted({str(e).strip() for e in matches["employee"].tolist() if str(e).strip()})) or None
+        actual_tariff = str(best_match_row.get("tariff_key") or "").strip()
+        actual_employee = str(best_match_row.get("employee") or "").strip()
+        effective_employee = actual_employee or planned_employee or None
 
-        if not tariff_p and not actual_tariffs:
-            prescription_status = ReconciliationStatus.NO_SERVICES.value
-        else:
-            rx_tariff = tariff_p
-            if not rx_tariff and len(actual_tariffs) == 1:
-                rx_tariff = actual_tariffs[0]
+        service_dt = best_match_row.get("service_date") or plan_date
+        prescription_status = _check_prescription_01(prescriptions_df, name_key, service_dt)
 
-            prescription_status = _choose_prescription_status(rx_lookup, name_key, rx_tariff, plan_date)
-
-        tariff_mismatch = bool(tariff_p and actual_tariffs and any(t != tariff_p for t in actual_tariffs))
+        tariff_mismatch = bool(tariff_p and actual_tariff and tariff_p != actual_tariff)
         deviation_pct = abs(deviation) / plan_min * 100 if (deviation is not None and plan_min > 0) else 0.0
 
         if tariff_mismatch:
@@ -407,27 +457,26 @@ def reconcile_plan_actual(
             detail_status = PlanActualStatus.OK.value
             note = None
 
-        recorded_start = min([d for d in matches["service_start"].tolist() if d is not None], default=None)
-        recorded_end = max([d for d in matches["service_end"].tolist() if d is not None], default=None)
-
         overall = _merge_overall(detail_status, prescription_status)
+        color = _compute_status_color(overall.value, detail_status, prescription_status)
 
         pa_rows.append(
             PlanActualRow(
                 patient=str(plan.get("patient_col") or name_key),
-                employee=employee_display,
-                service_date=plan_date_display,
+                employee=effective_employee,
+                service_date=_fmt_date(service_dt) or plan_date_display,
                 planned_time=plan_time_display,
-                recorded_time=_fmt_time_window(recorded_start, recorded_end),
+                recorded_time=_fmt_time_window(best_match_row.get("service_start"), best_match_row.get("service_end")),
                 tarifziffer_plan=tariff_p or None,
-                tarifziffer_actual=actual_tariff_display,
-                tariff=tariff_p or actual_tariff_display,
+                tarifziffer_actual=actual_tariff or None,
+                tariff=tariff_p or actual_tariff or None,
                 planned_minutes=plan_min if plan_min > 0 else None,
                 actual_minutes=actual_min,
                 deviation_minutes=deviation,
                 prescription_status=prescription_status,
                 overall_status=overall.value,
                 status=detail_status,
+                status_color=color,
                 note=note,
             )
         )
@@ -435,20 +484,17 @@ def reconcile_plan_actual(
     unplanned = controlling_df[~controlling_df.index.isin(matched_ctrl_idx)]
     for _, row in unplanned.iterrows():
         row_date = row.get("service_date")
+        row_name_key = str(row.get("name_key") or "")
         row_tariff = str(row.get("tariff_key") or "").strip()
-        prescription_status = _choose_prescription_status(
-            rx_lookup,
-            str(row.get("name_key") or ""),
-            row_tariff,
-            row_date,
-        )
 
+        prescription_status = _check_prescription_01(prescriptions_df, row_name_key, row_date)
         detail_status = PlanActualStatus.BILLED_NOT_PLANNED.value
         overall = _merge_overall(detail_status, prescription_status)
+        color = _compute_status_color(overall.value, detail_status, prescription_status)
 
         pa_rows.append(
             PlanActualRow(
-                patient=str(row.get("patient_display") or row.get("Klient") or row.get("name_key")),
+                patient=str(row.get("patient_display") or row.get("Klient") or row_name_key),
                 employee=str(row.get("employee") or "").strip() or None,
                 service_date=_fmt_date(row_date),
                 planned_time=None,
@@ -462,6 +508,7 @@ def reconcile_plan_actual(
                 prescription_status=prescription_status,
                 overall_status=overall.value,
                 status=detail_status,
+                status_color=color,
                 note="Verrechnet ohne passenden Plan-Einsatz",
             )
         )

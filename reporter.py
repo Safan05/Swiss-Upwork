@@ -4,6 +4,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from typing import Optional
 from models.schemas import ReconciliationSummary, PlanActualSummary
 from models.enums import ReconciliationStatus, STATUS_LABELS, PlanActualStatus, PLAN_ACTUAL_LABELS, OverallStatus
@@ -146,11 +147,23 @@ def generate_report(
             OverallStatus.GREEN.value: "C6EFCE",
             OverallStatus.YELLOW.value: "FFEB9C",
             OverallStatus.RED.value: "FFC7CE",
+            "RED": "FFC7CE",
+            "Red": "FFC7CE",
+            "YELLOW": "FFEB9C",
+            "Yellow": "FFEB9C",
+            "GREEN": "C6EFCE",
+            "Green": "C6EFCE",
         }
         overall_font = {
             OverallStatus.GREEN.value: "276221",
             OverallStatus.YELLOW.value: "9C5700",
             OverallStatus.RED.value: "9C0006",
+            "RED": "9C0006",
+            "Red": "9C0006",
+            "YELLOW": "9C5700",
+            "Yellow": "9C5700",
+            "GREEN": "276221",
+            "Green": "276221",
         }
 
         prescription_label = {
@@ -160,6 +173,12 @@ def generate_report(
             ReconciliationStatus.EXCEEDED.value: "Rot",
             ReconciliationStatus.OUT_OF_RANGE.value: "Rot",
             ReconciliationStatus.NO_PRESCRIPTION.value: "Rot",
+            "Red": "Rot",
+            "Rot": "Rot",
+            "Green": "Gruen",
+            "Gruen": "Gruen",
+            "Yellow": "Gelb",
+            "Gelb": "Gelb",
         }
 
         ws_pa = wb.create_sheet("Plan vs. Ist")
@@ -257,7 +276,16 @@ def generate_report(
         pa_col_widths = [28, 18, 12, 14, 14, 14, 16, 14, 24, 14, 14, 16, 36]
         for i, w in enumerate(pa_col_widths, 1):
             ws_pa.column_dimensions[get_column_letter(i)].width = w
-        ws_pa.freeze_panes = f"A{detail_start + 1}"
+            
+        # Convert the data range into a formatted Table
+        # This replaces freeze_panes, keeping only the headers (row 16) visible on scroll
+        # without taking up half the screen with the top summary.
+        last_col = get_column_letter(len(pa_headers))
+        end_row = ws_pa.max_row if ws_pa.max_row > detail_start else detail_start + 1
+        tab = Table(displayName="PlanIstAbgleich", ref=f"A{detail_start}:{last_col}{end_row}")
+        style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+        tab.tableStyleInfo = style
+        ws_pa.add_table(tab)
 
     buf = io.BytesIO()
     wb.save(buf)

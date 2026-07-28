@@ -489,6 +489,7 @@ def parse_planning(file_bytes: bytes) -> pd.DataFrame:
 
     tariff_col = _find_col(df, ["Tarifziffer", "Tarif", "Tarifcode", "Leistung", "Leistung-Nr", "Leistungsart"])
     tariff_text_col = _find_col(df, ["Leistung", "Leistungsart", "Tariftext"])
+    employee_col = _find_col(df, ["Mitarbeiter", "Mitarbeiter/in", "MitarbeiterIn", "Leistungserbringer", "Erbringer", "Durchgeführt von", "Benutzer", "Pflegende Person", "Person"])
 
     missing = []
     if patient_col is None:
@@ -506,6 +507,11 @@ def parse_planning(file_bytes: bytes) -> pd.DataFrame:
     df["name_key"] = df.apply(lambda r: _name_key(r["nachname"], r["vorname"]), axis=1)
     df["patient_col"] = df[patient_col].astype(str).str.strip()
     df["patient_id"] = _resolve_patient_id(df)
+    
+    if employee_col:
+        df["employee"] = df[employee_col].astype(str).str.strip()
+    else:
+        df["employee"] = ""
 
     starts: list[Optional[datetime]] = []
     ends: list[Optional[datetime]] = []
