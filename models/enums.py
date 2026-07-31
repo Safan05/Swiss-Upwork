@@ -29,13 +29,15 @@ class PlanActualStatus(str, Enum):
     TARIFF_MISMATCH = "TARIFF_MISMATCH"
 
 
-PLAN_ACTUAL_LABELS: dict[PlanActualStatus, str] = {
+PLAN_ACTUAL_LABELS: dict[PlanActualStatus | str, str] = {
     PlanActualStatus.OK: "✓ OK",
     PlanActualStatus.MINOR_DEVIATION: "⚠ Kleine Abweichung",
     PlanActualStatus.MAJOR_DEVIATION: "✗ Grosse Abweichung",
     PlanActualStatus.BILLED_NOT_PLANNED: "✗ Nur verrechnet",
-    PlanActualStatus.PLANNED_NOT_BILLED: "! Nur geplant",
+    PlanActualStatus.PLANNED_NOT_BILLED: "Nur geplant",
     PlanActualStatus.TARIFF_MISMATCH: "✗ Tarifabweichung",
+    "PLANNED_NOT_BILLED": "Nur geplant",
+    "Nur geplant": "Nur geplant",
 }
 
 

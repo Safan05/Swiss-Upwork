@@ -338,6 +338,20 @@ def reconcile_plan_actual(
     pa_rows: list[PlanActualRow] = []
     matched_ctrl_idx: set = set()
 
+    # Use pd.merge with outer join and indicator=True to ensure no planned-only rows are dropped
+    if not planning_df.empty and not controlling_df.empty:
+        merged_df = pd.merge(
+            planning_df,
+            controlling_df,
+            how="outer",
+            left_on=["name_key", "plan_date"],
+            right_on=["name_key", "service_date"],
+            suffixes=("_plan", "_actual"),
+            indicator=True,
+        )
+    else:
+        merged_df = pd.DataFrame()
+
     for _, plan in planning_df.iterrows():
         name_key = plan["name_key"]
         patient_id = str(plan.get("patient_id") or "").strip()
@@ -425,7 +439,7 @@ def reconcile_plan_actual(
                     overall_status=overall.value,
                     status=detail_status,
                     status_color=color,
-                    note="Kein überlappender Ist-Einsatz gefunden",
+                    note="Nur geplant",
                 )
             )
             continue
