@@ -1,3 +1,5 @@
+import re
+import unicodedata
 import pandas as pd
 from collections import Counter
 from datetime import datetime
@@ -98,8 +100,6 @@ def _detail_to_overall(status: str) -> OverallStatus:
 
 
 def _merge_overall(detail_status: str, prescription_status: str) -> OverallStatus:
-    if prescription_status in {"Red", "Rot", ReconciliationStatus.NO_PRESCRIPTION.value, ReconciliationStatus.EXCEEDED.value, ReconciliationStatus.OUT_OF_RANGE.value}:
-        return OverallStatus.RED
     return _detail_to_overall(detail_status)
 
 
@@ -138,7 +138,6 @@ def _check_prescription_01(
 def _compute_status_color(overall_status: str, detail_status: str, prescription_status: str) -> str:
     if (
         overall_status in {OverallStatus.RED.value, "RED", "Rot", "Red"}
-        or prescription_status in {"Red", "Rot", ReconciliationStatus.NO_PRESCRIPTION.value, ReconciliationStatus.EXCEEDED.value}
         or detail_status in {PlanActualStatus.PLANNED_NOT_BILLED.value, PlanActualStatus.BILLED_NOT_PLANNED.value, PlanActualStatus.MAJOR_DEVIATION.value, PlanActualStatus.TARIFF_MISMATCH.value}
     ):
         return "Red"
@@ -167,6 +166,29 @@ def _time_overlap(plan_start: datetime | None, plan_end: datetime | None, actual
     if actual_end is None:
         actual_end = actual_start
     return actual_start <= plan_end and actual_end >= plan_start
+
+
+def _normalize_employee_key(name: str) -> str:
+    """Lowercase, strip, collapse whitespace, and remove accents for reliable employee matching."""
+    s = str(name or "").strip()
+    # Collapse multiple spaces (common copy-paste artifact from exports)
+    s = re.sub(r"\s+", " ", s)
+    # Strip accents
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower().strip()
+
+
+def _start_matches(plan_start: datetime | None, actual_start: datetime | None) -> bool:
+    """True when the plan and actual share the exact same start time (minute-level).
+    Used as a secondary match tier when plan_end is missing."""
+    if plan_start is None or actual_start is None:
+        return False
+    return (
+        plan_start.date() == actual_start.date()
+        and plan_start.hour == actual_start.hour
+        and plan_start.minute == actual_start.minute
+    )
 
 
 def _choose_prescription_status(
@@ -338,19 +360,39 @@ def reconcile_plan_actual(
     pa_rows: list[PlanActualRow] = []
     matched_ctrl_idx: set = set()
 
-    # Use pd.merge with outer join and indicator=True to ensure no planned-only rows are dropped
-    if not planning_df.empty and not controlling_df.empty:
-        merged_df = pd.merge(
-            planning_df,
-            controlling_df,
-            how="outer",
-            left_on=["name_key", "plan_date"],
-            right_on=["name_key", "service_date"],
-            suffixes=("_plan", "_actual"),
-            indicator=True,
+    # ---------------------------------------------------------------------------
+    # Pre-normalize employee keys on BOTH dataframes before any matching.
+    # This handles whitespace artifacts (e.g. 'Labazanova  Chedi' vs 'Labazanova Chedi')
+    # and mixed casing that prevent reliable employee-level comparisons.
+    # ---------------------------------------------------------------------------
+    if not planning_df.empty:
+        planning_df = planning_df.copy()
+        planning_df["employee"] = planning_df["employee"].astype(str).str.strip()
+        planning_df["employee_key"] = planning_df["employee"].apply(_normalize_employee_key)
+        # Ensure plan_date is a pure date-level datetime (no time component)
+        planning_df["plan_date"] = planning_df["plan_date"].apply(
+            lambda d: datetime(d.year, d.month, d.day) if d is not None else None
         )
-    else:
-        merged_df = pd.DataFrame()
+
+    if not controlling_df.empty:
+        controlling_df = controlling_df.copy()
+        controlling_df["employee"] = controlling_df["employee"].astype(str).str.strip()
+        controlling_df["employee_key"] = controlling_df["employee"].apply(_normalize_employee_key)
+        # Ensure service_date is a pure date-level datetime (no time component)
+        controlling_df["service_date"] = controlling_df["service_date"].apply(
+            lambda d: datetime(d.year, d.month, d.day) if d is not None else None
+        )
+
+    # ---------------------------------------------------------------------------
+    # Build a lookup: for each (name_key, plan_date) in planning, record the set
+    # of normalized employee keys that have a PLANNED row. Used to prevent the
+    # date-only fallback from stealing ctrl slots for a different employee when
+    # another plan row on the same date has a same-employee ctrl entry available.
+    # ---------------------------------------------------------------------------
+    plan_date_employee_keys: dict[tuple, set] = {}
+    for _, r in planning_df.iterrows():
+        key = (r["name_key"], r.get("plan_date"))
+        plan_date_employee_keys.setdefault(key, set()).add(r.get("employee_key", ""))
 
     for _, plan in planning_df.iterrows():
         name_key = plan["name_key"]
@@ -366,6 +408,7 @@ def reconcile_plan_actual(
         plan_date_display = _fmt_date(plan_date)
         plan_time_display = _fmt_time_window(plan_start, plan_end)
         planned_employee = str(plan.get("employee") or "").strip()
+        planned_employee_key = _normalize_employee_key(planned_employee)
 
         if patient_id:
             patient_mask = (controlling_df["patient_id"] == patient_id) | (controlling_df["name_key"] == name_key)
@@ -378,6 +421,9 @@ def reconcile_plan_actual(
         best_match_row = None
 
         if not available_candidates.empty:
+            # -----------------------------------------------------------------
+            # Tier 1: Time-window overlap + same employee (most specific)
+            # -----------------------------------------------------------------
             if plan_start and plan_end:
                 overlap_mask = available_candidates.apply(
                     lambda r: _time_overlap(plan_start, plan_end, r.get("service_start"), r.get("service_end")),
@@ -385,36 +431,101 @@ def reconcile_plan_actual(
                 )
                 overlap_candidates = available_candidates[overlap_mask]
                 if not overlap_candidates.empty:
-                    if tariff_p:
-                        same_tariff = overlap_candidates[overlap_candidates["tariff_key"] == tariff_p]
-                        if not same_tariff.empty:
-                            overlap_candidates = same_tariff
-                    best_match_idx = overlap_candidates.index[0]
-                    best_match_row = overlap_candidates.iloc[0]
+                    # Prefer same-employee match within overlapping candidates
+                    same_emp = overlap_candidates[
+                        overlap_candidates["employee_key"] == planned_employee_key
+                    ]
+                    if not same_emp.empty:
+                        overlap_candidates = same_emp
+                    else:
+                        if tariff_p:
+                            same_tariff = overlap_candidates[overlap_candidates["tariff_key"] == tariff_p]
+                            if not same_tariff.empty:
+                                overlap_candidates = same_tariff
+                        
+                        # Sanity check for cross-employee matches: avoid matching completely different shifts
+                        valid_cross = []
+                        for idx, c_row in overlap_candidates.iterrows():
+                            a_min = float(c_row.get("duration_min") or 0)
+                            if plan_min > 0 and a_min > 0:
+                                if abs(a_min - plan_min) / plan_min <= 1.5:
+                                    valid_cross.append(idx)
+                            else:
+                                valid_cross.append(idx)
+                        overlap_candidates = overlap_candidates.loc[valid_cross]
 
-            if best_match_row is None and plan_date is not None:
-                date_candidates = available_candidates[available_candidates["service_date"].apply(
-                    lambda d: d is not None and d == plan_date
-                )]
-                if not date_candidates.empty:
-                    if tariff_p:
-                        same_tariff = date_candidates[date_candidates["tariff_key"] == tariff_p]
-                        if not same_tariff.empty:
-                            date_candidates = same_tariff
-                    best_match_idx = date_candidates.index[0]
-                    best_match_row = date_candidates.iloc[0]
+                    if not overlap_candidates.empty:
+                        def _dur_diff(idx):
+                            c_dur = float(overlap_candidates.loc[idx].get("duration_min") or 0)
+                            return abs(c_dur - plan_min)
+                        best_match_idx = sorted(overlap_candidates.index, key=_dur_diff)[0]
+                        best_match_row = overlap_candidates.loc[best_match_idx]
 
+            # -----------------------------------------------------------------
+            # Tier 2: Exact start-time match (handles plan_end=None gracefully)
+            # When the planning export lacks end times, we match on start time
+            # precision instead — much more reliable than date-only fallback.
+            # Prefer same-employee within these candidates.
+            # -----------------------------------------------------------------
+            if best_match_row is None and plan_start is not None:
+                start_match_mask = available_candidates.apply(
+                    lambda r: _start_matches(plan_start, r.get("service_start")),
+                    axis=1,
+                )
+                start_candidates = available_candidates[start_match_mask]
+                if not start_candidates.empty:
+                    same_emp = start_candidates[
+                        start_candidates["employee_key"] == planned_employee_key
+                    ]
+                    if not same_emp.empty:
+                        start_candidates = same_emp
+                    else:
+                        if tariff_p:
+                            same_tariff = start_candidates[start_candidates["tariff_key"] == tariff_p]
+                            if not same_tariff.empty:
+                                start_candidates = same_tariff
+                                
+                        valid_cross = []
+                        for idx, c_row in start_candidates.iterrows():
+                            a_min = float(c_row.get("duration_min") or 0)
+                            if plan_min > 0 and a_min > 0:
+                                if abs(a_min - plan_min) / plan_min <= 1.5:
+                                    valid_cross.append(idx)
+                            else:
+                                valid_cross.append(idx)
+                        start_candidates = start_candidates.loc[valid_cross]
+
+                    if not start_candidates.empty:
+                        def _dur_diff(idx):
+                            c_dur = float(start_candidates.loc[idx].get("duration_min") or 0)
+                            return abs(c_dur - plan_min)
+                        best_match_idx = sorted(start_candidates.index, key=_dur_diff)[0]
+                        best_match_row = start_candidates.loc[best_match_idx]
+
+            # -----------------------------------------------------------------
+            # Tier 3: Same date + SAME employee (strict employee match required)
+            # This prevents cross-employee slot stealing when multiple plan rows
+            # share the same patient+date but different employees.
+            # -----------------------------------------------------------------
             if best_match_row is None and plan_date is not None:
-                prox_candidates = available_candidates[available_candidates["service_date"].apply(
-                    lambda d: d is not None and 0 < (d - plan_date).days <= 1
-                )]
-                if not prox_candidates.empty:
+                date_same_emp = available_candidates[
+                    available_candidates["service_date"].apply(
+                        lambda d: d is not None and d == plan_date
+                    )
+                    & (available_candidates["employee_key"] == planned_employee_key)
+                ]
+                if not date_same_emp.empty:
                     if tariff_p:
-                        same_tariff = prox_candidates[prox_candidates["tariff_key"] == tariff_p]
+                        same_tariff = date_same_emp[date_same_emp["tariff_key"] == tariff_p]
                         if not same_tariff.empty:
-                            prox_candidates = same_tariff
-                    best_match_idx = prox_candidates.index[0]
-                    best_match_row = prox_candidates.iloc[0]
+                            date_same_emp = same_tariff
+                    def _dur_diff(idx):
+                        c_dur = float(date_same_emp.loc[idx].get("duration_min") or 0)
+                        return abs(c_dur - plan_min)
+                    best_match_idx = sorted(date_same_emp.index, key=_dur_diff)[0]
+                    best_match_row = date_same_emp.loc[best_match_idx]
+
+
 
         if best_match_row is None:
             prescription_status = _check_prescription_01(prescriptions_df, name_key, plan_date)

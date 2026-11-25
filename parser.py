@@ -485,7 +485,7 @@ def parse_planning(file_bytes: bytes) -> pd.DataFrame:
     date_col = _find_col(df, ["Datum", "Einsatzdatum", "Geplant am", "Startdatum"])
     start_time_col = _find_col(df, ["Startzeit", "Von", "Uhrzeit von"])
     end_time_col = _find_col(df, ["Endzeit", "Bis", "Uhrzeit bis"])
-    duration_col = _find_col(df, ["Dauer", "Minuten", "Zeit", "Geplante Dauer", "Geplante Minuten"])
+    duration_col = _find_col(df, ["Dauer", "Minuten", "Zeit", "Geplante Dauer", "Geplante Minuten", "Geplante Min", "Geplante Min."])
 
     tariff_col = _find_col(df, ["Tarifziffer", "Tarif", "Tarifcode", "Leistung", "Leistung-Nr", "Leistungsart"])
     tariff_text_col = _find_col(df, ["Leistung", "Leistungsart", "Tariftext"])
@@ -525,6 +525,8 @@ def parse_planning(file_bytes: bytes) -> pd.DataFrame:
             plan_start = _combine_date_and_time(row.get(date_col), row.get(start_time_col))
         if plan_start is None and start_col:
             plan_start = _parse_datetime(row.get(start_col))
+        if plan_start is None and start_time_col:
+            plan_start = _parse_datetime(row.get(start_time_col))
         if plan_start is None and date_col:
             plan_start = _parse_date(row.get(date_col))
 
@@ -533,6 +535,8 @@ def parse_planning(file_bytes: bytes) -> pd.DataFrame:
             plan_end = _combine_date_and_time(row.get(date_col), row.get(end_time_col))
         if plan_end is None and end_col:
             plan_end = _parse_datetime(row.get(end_col))
+        if plan_end is None and end_time_col:
+            plan_end = _parse_datetime(row.get(end_time_col))
 
         plan_min = _parse_duration_minutes(row.get(duration_col)) if duration_col else 0.0
 
